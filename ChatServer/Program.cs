@@ -2,6 +2,7 @@
 using System.Net.Sockets;
 using System.Text;
 using System.Collections.Concurrent;
+using System.Linq;
 
 // Server will listen on this port.
 // A port is like a "door number" on your computer.
@@ -9,7 +10,7 @@ const int Port = 7777;
 
 // Store connected clients.
 // ConcurrentDictionary is safe when many tasks/threads access it.
-var clients = new ConcurrentDictionary<int, TcpClient>();
+var clients = new ConcurrentDictionary<int, ClientSession>();
 
 // Create a TCP listener that listens on any network interface (your laptop's IPs).
 var listener = new TcpListener(IPAddress.Any, Port);
@@ -32,20 +33,22 @@ while (true)
     int id = clients.Count + 1;
 
     // Save the client
-    clients[id] = client;
+    var session = new ClientSession(id, client);
+    clients[id] = session;
+
 
     Console.WriteLine($"[SERVER] Client #{id} connected.");
 
     // Handle this client in the background so server can accept new clients too.
-    _ = HandleClientAsync(id, client);
+    _ = HandleClientAsync(session);
 }
 
 // This function handles reading messages from ONE client.
-async Task HandleClientAsync(int id, TcpClient client)
+async Task HandleClientAsync(ClientSession session)
 {
     try
     {
-        NetworkStream stream = client.GetStream();
+        NetworkStream stream = session.Client.GetStream();
 
         // Inform the client they connected
         await SendLineAsync(stream, "Welcome! Type messages. Use /quit to leave.");
@@ -64,20 +67,28 @@ async Task HandleClientAsync(int id, TcpClient client)
             if (line == "/quit") break;
 
             // Broadcast the message to everyone
-            await BroadcastAsync($"Client#{id}: {line}");
+            if (line.StartsWith("/"))
+            {
+                await HandleCommand(session, line);
+            }
+            else
+            {
+                await BroadcastAsync($"{session.Username}: {line}");
+            }
+
         }
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[SERVER] Error with Client #{id}: {ex.Message}");
+        Console.WriteLine($"[SERVER] Error with Client #{session.Id}: {ex.Message}");
     }
     finally
     {
         // Remove client and close connection
-        clients.TryRemove(id, out _);
-        client.Close();
-        Console.WriteLine($"[SERVER] Client #{id} disconnected.");
-        await BroadcastAsync($"[SERVER] Client#{id} left.");
+        clients.TryRemove(session.Id, out _);
+        session.Client.Close();
+        Console.WriteLine($"[SERVER] Client #{session.Id} disconnected.");
+        await BroadcastAsync($"[SERVER] Client#{session.Id} left.");
     }
 }
 
@@ -88,10 +99,10 @@ async Task BroadcastAsync(string message)
 
     foreach (var kv in clients)
     {
-        var c = kv.Value;
+        var session = kv.Value;
         try
         {
-            await SendLineAsync(c.GetStream(), message);
+            await SendLineAsync(session.Client.GetStream(), message);
         }
         catch
         {
@@ -128,4 +139,55 @@ static async Task SendLineAsync(NetworkStream stream, string line)
     byte[] data = Encoding.UTF8.GetBytes(line + "\n");
     await stream.WriteAsync(data, 0, data.Length);
 }
+
+async Task HandleCommand(ClientSession session, string command)
+{
+    var parts = command.Split(' ', 2);
+    var cmd = parts[0].ToLower();
+
+    switch (cmd)
+    {
+        case "/name":
+            if (parts.Length < 2)
+            {
+                await SendLineAsync(session.Client.GetStream(), "Usage: /name yourName");
+                return;
+            }
+
+            var oldName = session.Username;
+            session.Username = parts[1].Trim();
+            await BroadcastAsync($"{oldName} changed name to {session.Username}");
+            break;
+
+        case "/who":
+            var userList = string.Join(", ", clients.Values.Select(c => c.Username));
+            await SendLineAsync(session.Client.GetStream(), $"Online: {userList}");
+            break;
+
+        case "/help":
+            await SendLineAsync(session.Client.GetStream(),
+                "Commands: /name <newname>, /who, /help, /quit");
+            break;
+
+        default:
+            await SendLineAsync(session.Client.GetStream(), "Unknown command.");
+            break;
+    }
+}
+class ClientSession
+{
+    public int Id { get; }
+    public TcpClient Client { get; }
+    public string Username { get; set; }
+    public DateTime ConnectedAt { get; }
+
+    public ClientSession(int id, TcpClient client)
+    {
+        Id = id;
+        Client = client;
+        Username = $"Guest{id}";
+        ConnectedAt = DateTime.UtcNow;
+    }
+}
+
 
