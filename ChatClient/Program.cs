@@ -1,66 +1,156 @@
 ﻿using System.Net.Sockets;
 using System.Text;
+using System.Buffers.Binary;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
-const string Host = "127.0.0.1"; // localhost (your own computer)
+const string Host = "127.0.0.1";
 const int Port = 7777;
 
-var client = new TcpClient();
-
-// Connect to server
+using var client = new TcpClient();
 await client.ConnectAsync(Host, Port);
 client.NoDelay = true;
 
 Console.WriteLine($"[CLIENT] Connected to {Host}:{Port}");
-
 NetworkStream stream = client.GetStream();
 
-// Start a background task to read server messages
-_ = Task.Run(async () =>
+// Reader task: receive packets and print nicely
+var reader = Task.Run(async () =>
 {
-    while (true)
+    try
     {
-        string? line = await ReadLineAsync(stream);
-        if (line == null) break;
-        Console.WriteLine(line);
+        while (true)
+        {
+            var packet = await Wire.TryReadPacketAsync(stream);
+            if (packet == null) break;
+
+            if (packet.Type == "chat")
+                Console.WriteLine($"{packet.From}: {packet.Text}");
+            else if (packet.Type == "system")
+                Console.WriteLine($"[{packet.From}] {packet.Text}");
+            else
+                Console.WriteLine($"[{packet.Type}] {JsonUtil.ToJson(packet)}");
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[CLIENT] Reader error: {ex.Message}");
     }
 });
 
-// Main loop: read from keyboard and send to server
+// Writer loop: read from keyboard and send packets
 while (true)
 {
-    string? input = Console.ReadLine();
+    var input = Console.ReadLine();
     if (input == null) break;
 
-    await SendLineAsync(stream, input);
+    input = input.Trim();
+    if (input.Length == 0) continue;
 
-    if (input.Trim() == "/quit")
-        break;
+    if (input.StartsWith("/"))
+    {
+        // "/name Kasun" => name="name", args="Kasun"
+        var parts = input.Substring(1).Split(' ', 2);
+        var cmdName = parts[0];
+        var cmdArgs = parts.Length > 1 ? parts[1] : "";
+
+        var cmdPacket = new Packet("command", null, null, cmdName, cmdArgs);
+        await Wire.SendPacketAsync(stream, cmdPacket);
+
+        if (cmdName.Equals("quit", StringComparison.OrdinalIgnoreCase))
+            break;
+    }
+    else
+    {
+        var chatPacket = new Packet("chat", null, input, null, null);
+        await Wire.SendPacketAsync(stream, chatPacket);
+    }
 }
 
-client.Close();
+try { client.Close(); } catch { }
+try { await reader; } catch { }
 
-// Same helper methods as server
-static async Task<string?> ReadLineAsync(NetworkStream stream)
+// -------------------- Utilities (BOTTOM) --------------------
+
+static class JsonUtil
 {
-    var sb = new StringBuilder();
-    var buffer = new byte[1];
-
-    while (true)
+    public static readonly JsonSerializerOptions Opts = new()
     {
-        int read = await stream.ReadAsync(buffer, 0, 1);
-        if (read == 0) return null;
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    };
 
-        char ch = (char)buffer[0];
-        if (ch == '\n') break;
-        if (ch != '\r') sb.Append(ch);
+    public static Packet? TryParse(string json)
+    {
+        try { return JsonSerializer.Deserialize<Packet>(json, Opts); }
+        catch { return null; }
     }
 
-    return sb.ToString();
+    public static string ToJson(Packet p) => JsonSerializer.Serialize(p, Opts);
 }
 
-static async Task SendLineAsync(NetworkStream stream, string line)
+static class Wire
 {
-    byte[] data = Encoding.UTF8.GetBytes(line + "\n");
-    await stream.WriteAsync(data, 0, data.Length);
+    private const int MaxMessageSize = 64 * 1024;
+
+    public static async Task<byte[]?> ReadExactAsync(NetworkStream stream, int length)
+    {
+        byte[] buffer = new byte[length];
+        int offset = 0;
+
+        while (offset < length)
+        {
+            int read = await stream.ReadAsync(buffer, offset, length - offset);
+            if (read == 0) return null; // disconnected
+            offset += read;
+        }
+
+        return buffer;
+    }
+
+    public static async Task<string?> ReadMessageAsync(NetworkStream stream)
+    {
+        var lenBytes = await ReadExactAsync(stream, 4);
+        if (lenBytes == null) return null;
+
+        int length = BinaryPrimitives.ReadInt32BigEndian(lenBytes);
+        if (length < 0 || length > MaxMessageSize)
+            throw new InvalidOperationException($"Invalid message length: {length}");
+
+        var msgBytes = await ReadExactAsync(stream, length);
+        if (msgBytes == null) return null;
+
+        return Encoding.UTF8.GetString(msgBytes);
+    }
+
+    public static async Task SendMessageAsync(NetworkStream stream, string message)
+    {
+        byte[] msgBytes = Encoding.UTF8.GetBytes(message);
+        if (msgBytes.Length > MaxMessageSize)
+            throw new InvalidOperationException($"Message too large: {msgBytes.Length} bytes");
+
+        byte[] lenBytes = new byte[4];
+        BinaryPrimitives.WriteInt32BigEndian(lenBytes, msgBytes.Length);
+
+        await stream.WriteAsync(lenBytes, 0, lenBytes.Length);
+        await stream.WriteAsync(msgBytes, 0, msgBytes.Length);
+    }
+
+    public static async Task<Packet?> TryReadPacketAsync(NetworkStream stream)
+    {
+        var raw = await ReadMessageAsync(stream);
+        if (raw == null) return null;
+
+        return JsonUtil.TryParse(raw);
+    }
+
+    public static Task SendPacketAsync(NetworkStream stream, Packet packet)
+        => SendMessageAsync(stream, JsonUtil.ToJson(packet));
 }
 
+record Packet(
+    [property: JsonPropertyName("type")] string Type,
+    [property: JsonPropertyName("from")] string? From,
+    [property: JsonPropertyName("text")] string? Text,
+    [property: JsonPropertyName("name")] string? Name,
+    [property: JsonPropertyName("args")] string? Args
+);

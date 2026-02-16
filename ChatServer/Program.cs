@@ -3,80 +3,82 @@ using System.Net.Sockets;
 using System.Text;
 using System.Collections.Concurrent;
 using System.Linq;
+using System.Buffers.Binary;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
-// Server will listen on this port.
-// A port is like a "door number" on your computer.
 const int Port = 7777;
 
-// Store connected clients.
-// ConcurrentDictionary is safe when many tasks/threads access it.
 var clients = new ConcurrentDictionary<int, ClientSession>();
+int nextId = 0;
 
-// Create a TCP listener that listens on any network interface (your laptop's IPs).
 var listener = new TcpListener(IPAddress.Any, Port);
-
-// Start listening
 listener.Start();
 Console.WriteLine($"[SERVER] Listening on port {Port}...");
 
-// Accept clients forever
 while (true)
 {
-    // Wait until a new client connects
     TcpClient client = await listener.AcceptTcpClientAsync();
-
-    // NoDelay reduces latency (disables Nagle algorithm).
-    // Games often care about low-latency messages.
     client.NoDelay = true;
 
-    // Give this client an ID
-    int id = clients.Count + 1;
-
-    // Save the client
+    int id = Interlocked.Increment(ref nextId);
     var session = new ClientSession(id, client);
     clients[id] = session;
 
-
     Console.WriteLine($"[SERVER] Client #{id} connected.");
 
-    // Handle this client in the background so server can accept new clients too.
     _ = HandleClientAsync(session);
 }
 
-// This function handles reading messages from ONE client.
 async Task HandleClientAsync(ClientSession session)
 {
     try
     {
         NetworkStream stream = session.Client.GetStream();
 
-        // Inform the client they connected
-        await SendLineAsync(stream, "Welcome! Type messages. Use /quit to leave.");
+        // Welcome as a SYSTEM packet
+        await Wire.SendPacketAsync(stream, new Packet(
+            Type: "system", From: "SERVER",
+            Text: "Welcome! Type messages. Use /quit to leave.",
+            Name: null, Args: null
+        ));
 
-        // Read messages forever
         while (true)
         {
-            // Read one line from client
-            string? line = await ReadLineAsync(stream);
+            var packet = await Wire.TryReadPacketAsync(stream);
+            if (packet == null) break; // disconnect OR invalid framing
 
-            // If null, client disconnected (TCP connection ended)
-            if (line == null) break;
-
-            line = line.Trim();
-
-            if (line == "/quit") break;
-
-            // Broadcast the message to everyone
-            if (line.StartsWith("/"))
+            switch (packet.Type)
             {
-                await HandleCommand(session, line);
-            }
-            else
-            {
-                await BroadcastAsync($"{session.Username}: {line}");
-            }
+                case "chat":
+                    if (string.IsNullOrWhiteSpace(packet.Text)) break;
 
+                    await BroadcastPacketAsync(new Packet(
+                        Type: "chat",
+                        From: session.Username,              // server-authoritative
+                        Text: packet.Text.Trim(),
+                        Name: null, Args: null
+                    ));
+                    break;
+
+                case "command":
+                    await HandleCommandPacketAsync(session, packet);
+                    break;
+
+                default:
+                    await Wire.SendPacketAsync(stream, new Packet(
+                        Type: "system", From: "SERVER",
+                        Text: $"Unknown packet type: {packet.Type}",
+                        Name: null, Args: null
+                    ));
+                    break;
+            }
         }
+    }
+    catch (InvalidOperationException ex)
+    {
+        // e.g. invalid message length -> likely malicious or protocol mismatch
+        Console.WriteLine($"[SERVER] Protocol error for {session.Username}: {ex.Message}");
     }
     catch (Exception ex)
     {
@@ -84,96 +86,176 @@ async Task HandleClientAsync(ClientSession session)
     }
     finally
     {
-        // Remove client and close connection
         clients.TryRemove(session.Id, out _);
-        session.Client.Close();
-        Console.WriteLine($"[SERVER] Client #{session.Id} disconnected.");
-        await BroadcastAsync($"[SERVER] Client#{session.Id} left.");
+        try { session.Client.Close(); } catch { }
+
+        Console.WriteLine($"[SERVER] {session.Username} disconnected.");
+
+        await BroadcastPacketAsync(new Packet(
+            Type: "system", From: "SERVER",
+            Text: $"{session.Username} left.",
+            Name: null, Args: null
+        ));
     }
 }
 
-// Send message to all clients
-async Task BroadcastAsync(string message)
+async Task BroadcastPacketAsync(Packet packet)
 {
-    Console.WriteLine(message);
+    string json = JsonUtil.ToJson(packet);
+    Console.WriteLine($"[BROADCAST] {json}");
 
     foreach (var kv in clients)
     {
-        var session = kv.Value;
+        var s = kv.Value;
         try
         {
-            await SendLineAsync(session.Client.GetStream(), message);
+            await Wire.SendMessageAsync(s.Client.GetStream(), json);
         }
-        catch
-        {
-            // If sending fails, ignore. The read loop will detect disconnect later.
-        }
+        catch { }
     }
 }
 
-// Reads text until "\n". This is our simple "message boundary".
-static async Task<string?> ReadLineAsync(NetworkStream stream)
+async Task HandleCommandPacketAsync(ClientSession session, Packet packet)
 {
-    var sb = new StringBuilder();
-    var buffer = new byte[1];
+    var stream = session.Client.GetStream();
+    var name = (packet.Name ?? "").Trim().ToLowerInvariant();
+    var args = (packet.Args ?? "").Trim();
 
-    while (true)
+    switch (name)
     {
-        int read = await stream.ReadAsync(buffer, 0, 1);
-
-        // read == 0 means the connection was closed
-        if (read == 0) return null;
-
-        char ch = (char)buffer[0];
-
-        if (ch == '\n') break;       // end of message
-        if (ch != '\r') sb.Append(ch); // ignore carriage return
-    }
-
-    return sb.ToString();
-}
-
-// Sends text + "\n" so the receiver knows where message ends.
-static async Task SendLineAsync(NetworkStream stream, string line)
-{
-    byte[] data = Encoding.UTF8.GetBytes(line + "\n");
-    await stream.WriteAsync(data, 0, data.Length);
-}
-
-async Task HandleCommand(ClientSession session, string command)
-{
-    var parts = command.Split(' ', 2);
-    var cmd = parts[0].ToLower();
-
-    switch (cmd)
-    {
-        case "/name":
-            if (parts.Length < 2)
+        case "name":
+            if (string.IsNullOrWhiteSpace(args))
             {
-                await SendLineAsync(session.Client.GetStream(), "Usage: /name yourName");
+                await Wire.SendPacketAsync(stream, new Packet(
+                    Type: "system", From: "SERVER",
+                    Text: "Usage: /name <newname>",
+                    Name: null, Args: null
+                ));
                 return;
             }
 
-            var oldName = session.Username;
-            session.Username = parts[1].Trim();
-            await BroadcastAsync($"{oldName} changed name to {session.Username}");
+            var old = session.Username;
+            session.Username = args;
+
+            await BroadcastPacketAsync(new Packet(
+                Type: "system", From: "SERVER",
+                Text: $"{old} changed name to {session.Username}",
+                Name: null, Args: null
+            ));
             break;
 
-        case "/who":
-            var userList = string.Join(", ", clients.Values.Select(c => c.Username));
-            await SendLineAsync(session.Client.GetStream(), $"Online: {userList}");
+        case "who":
+            var list = string.Join(", ", clients.Values.Select(c => c.Username));
+            await Wire.SendPacketAsync(stream, new Packet(
+                Type: "system", From: "SERVER",
+                Text: $"Online: {list}",
+                Name: null, Args: null
+            ));
             break;
 
-        case "/help":
-            await SendLineAsync(session.Client.GetStream(),
-                "Commands: /name <newname>, /who, /help, /quit");
+        case "help":
+            await Wire.SendPacketAsync(stream, new Packet(
+                Type: "system", From: "SERVER",
+                Text: "Commands: /name <newname>, /who, /help, /quit",
+                Name: null, Args: null
+            ));
+            break;
+
+        case "quit":
+            try { session.Client.Close(); } catch { }
             break;
 
         default:
-            await SendLineAsync(session.Client.GetStream(), "Unknown command.");
+            await Wire.SendPacketAsync(stream, new Packet(
+                Type: "system", From: "SERVER",
+                Text: $"Unknown command: /{name}",
+                Name: null, Args: null
+            ));
             break;
     }
 }
+
+// -------------------- Utilities (BOTTOM) --------------------
+
+static class JsonUtil
+{
+    public static readonly JsonSerializerOptions Opts = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    };
+
+    public static Packet? TryParse(string json)
+    {
+        try { return JsonSerializer.Deserialize<Packet>(json, Opts); }
+        catch { return null; }
+    }
+
+    public static string ToJson(Packet p) => JsonSerializer.Serialize(p, Opts);
+}
+
+static class Wire
+{
+    private const int MaxMessageSize = 64 * 1024;
+
+    public static async Task<byte[]?> ReadExactAsync(NetworkStream stream, int length)
+    {
+        byte[] buffer = new byte[length];
+        int offset = 0;
+
+        while (offset < length)
+        {
+            int read = await stream.ReadAsync(buffer, offset, length - offset);
+            if (read == 0) return null;
+            offset += read;
+        }
+
+        return buffer;
+    }
+
+    public static async Task<string?> ReadMessageAsync(NetworkStream stream)
+    {
+        var lenBytes = await ReadExactAsync(stream, 4);
+        if (lenBytes == null) return null;
+
+        int length = BinaryPrimitives.ReadInt32BigEndian(lenBytes);
+
+        if (length < 0 || length > MaxMessageSize)
+            throw new InvalidOperationException($"Invalid message length: {length}");
+
+        var msgBytes = await ReadExactAsync(stream, length);
+        if (msgBytes == null) return null;
+
+        return Encoding.UTF8.GetString(msgBytes);
+    }
+
+    public static async Task SendMessageAsync(NetworkStream stream, string message)
+    {
+        byte[] msgBytes = Encoding.UTF8.GetBytes(message);
+        if (msgBytes.Length > MaxMessageSize)
+            throw new InvalidOperationException($"Message too large: {msgBytes.Length} bytes");
+
+        byte[] lenBytes = new byte[4];
+        BinaryPrimitives.WriteInt32BigEndian(lenBytes, msgBytes.Length);
+
+        await stream.WriteAsync(lenBytes, 0, lenBytes.Length);
+        await stream.WriteAsync(msgBytes, 0, msgBytes.Length);
+    }
+
+    public static async Task<Packet?> TryReadPacketAsync(NetworkStream stream)
+    {
+        var raw = await ReadMessageAsync(stream);
+        if (raw == null) return null;
+
+        // If JSON invalid, treat as "invalid packet" and keep connection alive OR close
+        // Here: we return a SYSTEM error packet? We'll just return null? No—better:
+        var pkt = JsonUtil.TryParse(raw);
+        return pkt; // could be null; caller can decide
+    }
+
+    public static Task SendPacketAsync(NetworkStream stream, Packet packet)
+        => SendMessageAsync(stream, JsonUtil.ToJson(packet));
+}
+
 class ClientSession
 {
     public int Id { get; }
@@ -190,4 +272,10 @@ class ClientSession
     }
 }
 
-
+record Packet(
+    [property: JsonPropertyName("type")] string Type,
+    [property: JsonPropertyName("from")] string? From,
+    [property: JsonPropertyName("text")] string? Text,
+    [property: JsonPropertyName("name")] string? Name,
+    [property: JsonPropertyName("args")] string? Args
+);
