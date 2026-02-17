@@ -16,6 +16,8 @@ var listener = new TcpListener(IPAddress.Any, Port);
 listener.Start();
 Console.WriteLine($"[SERVER] Listening on port {Port}...");
 
+_= HeartBeatCheck();
+
 while (true)
 {
     TcpClient client = await listener.AcceptTcpClientAsync();
@@ -29,6 +31,41 @@ while (true)
 
     _ = HandleClientAsync(session);
 }
+
+ async Task HeartBeatCheck(){
+
+    var PingInterval = TimeSpan.FromSeconds(10);
+    var Timeout = TimeSpan.FromSeconds(30);
+
+    while(true){
+        
+        await Task.Delay(PingInterval);
+
+         var packet = new Packet(
+            Type: "ping",
+            From: "SERVER",
+            Text: $"Server time: {DateTime.UtcNow:HH:mm:ss}",
+            Name: null,
+            Args: null
+        );
+
+        await BroadcastPacketAsync(packet);
+
+        var now = DateTime.UtcNow;
+
+         foreach (var kv in clients)
+        {
+            var s = kv.Value;
+            if (now - s.LastSeenUtc > Timeout)
+            {
+                Console.WriteLine($"[SERVER] Timing out {s.Username} (last seen {s.LastSeenUtc:HH:mm:ss})");
+
+                // Close socket; HandleClientAsync will clean up in finally
+                try { s.Client.Close(); } catch { }
+            }
+        }
+    }
+ }
 
 async Task HandleClientAsync(ClientSession session)
 {
@@ -47,6 +84,7 @@ async Task HandleClientAsync(ClientSession session)
         {
             var packet = await Wire.TryReadPacketAsync(stream);
             if (packet == null) break; // disconnect OR invalid framing
+            session.LastSeenUtc = DateTime.UtcNow;
 
             switch (packet.Type)
             {
@@ -64,6 +102,11 @@ async Task HandleClientAsync(ClientSession session)
                 case "command":
                     await HandleCommandPacketAsync(session, packet);
                     break;
+
+                case "pong":
+                    session.LastSeenUtc = DateTime.UtcNow;
+                     break;
+
 
                 default:
                     await Wire.SendPacketAsync(stream, new Packet(
@@ -258,6 +301,7 @@ static class Wire
 
 class ClientSession
 {
+    public DateTime LastSeenUtc { get; set; }
     public int Id { get; }
     public TcpClient Client { get; }
     public string Username { get; set; }
@@ -269,6 +313,7 @@ class ClientSession
         Client = client;
         Username = $"Guest{id}";
         ConnectedAt = DateTime.UtcNow;
+        LastSeenUtc = DateTime.UtcNow;
     }
 }
 

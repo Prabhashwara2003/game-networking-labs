@@ -24,6 +24,9 @@ var reader = Task.Run(async () =>
             var packet = await Wire.TryReadPacketAsync(stream);
             if (packet == null) break;
 
+            if (packet.Type == "ping")
+                await Wire.SendPacketAsync(stream, new Packet("pong", null, null, null, null));
+
             if (packet.Type == "chat")
                 Console.WriteLine($"{packet.From}: {packet.Text}");
             else if (packet.Type == "system")
