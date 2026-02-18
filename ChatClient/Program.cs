@@ -12,6 +12,26 @@ await client.ConnectAsync(Host, Port);
 client.NoDelay = true;
 
 Console.WriteLine($"[CLIENT] Connected to {Host}:{Port}");
+Console.WriteLine("----------------------------------------");
+Console.WriteLine("Welcome to the Multiplayer Chat Server");
+Console.WriteLine();
+Console.WriteLine("Available commands:");
+Console.WriteLine();
+Console.WriteLine("General:");
+Console.WriteLine("  /name <newname>     - Change your username");
+Console.WriteLine("  /who                - List online users");
+Console.WriteLine("  /help               - Show help");
+Console.WriteLine("  /quit               - Disconnect");
+Console.WriteLine();
+Console.WriteLine("Rooms:");
+Console.WriteLine("  /create <room>      - Create and join a room");
+Console.WriteLine("  /join <room>        - Join existing room");
+Console.WriteLine("  /leave              - Leave current room");
+Console.WriteLine("  /rooms              - List available rooms");
+Console.WriteLine("  /where              - Show current room");
+Console.WriteLine("----------------------------------------");
+Console.WriteLine();
+
 NetworkStream stream = client.GetStream();
 
 // Reader task: receive packets and print nicely
@@ -25,8 +45,10 @@ var reader = Task.Run(async () =>
             if (packet == null) break;
 
             if (packet.Type == "ping")
+            {
                 await Wire.SendPacketAsync(stream, new Packet("pong", null, null, null, null));
-
+                continue;
+            }
             if (packet.Type == "chat")
                 Console.WriteLine($"{packet.From}: {packet.Text}");
             else if (packet.Type == "system")

@@ -10,6 +10,10 @@ using System.Text.Json.Serialization;
 const int Port = 7777;
 
 var clients = new ConcurrentDictionary<int, ClientSession>();
+var rooms = new ConcurrentDictionary<string, ConcurrentDictionary<int, ClientSession>>(
+    StringComparer.OrdinalIgnoreCase
+);
+
 int nextId = 0;
 
 var listener = new TcpListener(IPAddress.Any, Port);
@@ -31,6 +35,70 @@ while (true)
 
     _ = HandleClientAsync(session);
 }
+
+
+async Task JoinRoomAsync(ClientSession session, string roomName)
+{
+    roomName = roomName.Trim();
+    if (roomName.Length == 0) return;
+
+    await LeaveRoomAsync(session);
+
+    var room = rooms.GetOrAdd(roomName, _ => new ConcurrentDictionary<int, ClientSession>());
+    room[session.Id] = session;
+    session.Room = roomName;
+
+    await Wire.SendPacketAsync(session.Client.GetStream(), new Packet(
+        "system", "SERVER", $"Joined room '{roomName}'.", null, null
+    ));
+
+    await BroadcastToRoomAsync(roomName, new Packet(
+        "system", "SERVER", $"{session.Username} joined the room.", null, null
+    ));
+}
+
+async Task LeaveRoomAsync(ClientSession session)
+{
+    if (session.Room == null) return;
+
+    var roomName = session.Room;
+
+    if (rooms.TryGetValue(roomName, out var roomMembers))
+    {
+        roomMembers.TryRemove(session.Id, out _);
+
+        // If room becomes empty, delete it
+        if (roomMembers.IsEmpty)
+            rooms.TryRemove(roomName, out _);
+    }
+
+    session.Room = null;
+
+    await Wire.SendPacketAsync(session.Client.GetStream(), new Packet(
+        "system", "SERVER", $"Left room '{roomName}'.", null, null
+    ));
+
+    await BroadcastToRoomAsync(roomName, new Packet(
+        "system", "SERVER", $"{session.Username} left the room.", null, null
+    ));
+}
+
+async Task BroadcastToRoomAsync(string roomName, Packet packet)
+{
+    if (!rooms.TryGetValue(roomName, out var roomMembers))
+        return;
+
+    var json = JsonUtil.ToJson(packet);
+
+    foreach (var kv in roomMembers)
+    {
+        var s = kv.Value;
+        try { await Wire.SendMessageAsync(s.Client.GetStream(), json); }
+        catch { }
+    }
+}
+
+
 
  async Task HeartBeatCheck(){
 
@@ -91,12 +159,23 @@ async Task HandleClientAsync(ClientSession session)
                 case "chat":
                     if (string.IsNullOrWhiteSpace(packet.Text)) break;
 
-                    await BroadcastPacketAsync(new Packet(
-                        Type: "chat",
-                        From: session.Username,              // server-authoritative
-                        Text: packet.Text.Trim(),
-                        Name: null, Args: null
-                    ));
+                   var chatPacket = new Packet(
+                                Type: "chat",
+                                From: session.Username,
+                                Text: packet.Text!.Trim(),
+                                Name: null, Args: null
+                            );
+
+                            if (session.Room == null)
+                            {
+                                // global lobby (current behavior)
+                                await BroadcastPacketAsync(chatPacket);
+                            }
+                            else
+                            {
+                                // room-only
+                                await BroadcastToRoomAsync(session.Room, chatPacket);
+                            };
                     break;
 
                 case "command":
@@ -129,6 +208,7 @@ async Task HandleClientAsync(ClientSession session)
     }
     finally
     {
+        await LeaveRoomAsync(session);
         clients.TryRemove(session.Id, out _);
         try { session.Client.Close(); } catch { }
 
@@ -207,6 +287,51 @@ async Task HandleCommandPacketAsync(ClientSession session, Packet packet)
         case "quit":
             try { session.Client.Close(); } catch { }
             break;
+        
+        case "create":
+            if (string.IsNullOrWhiteSpace(args))
+            {
+                await Wire.SendPacketAsync(stream, new Packet("system", "SERVER", "Usage: /create <roomName>", null, null));
+                return;
+            }
+
+            // create just ensures it exists, then joins
+            rooms.TryAdd(args.Trim(), new ConcurrentDictionary<int, ClientSession>());
+            await JoinRoomAsync(session, args);
+            break;
+
+        case "join":
+            if (string.IsNullOrWhiteSpace(args))
+            {
+                await Wire.SendPacketAsync(stream, new Packet("system", "SERVER", "Usage: /join <roomName>", null, null));
+                return;
+            }
+            await JoinRoomAsync(session, args);
+            break;
+
+        case "leave":
+            await LeaveRoomAsync(session);
+            break;
+
+        case "rooms":
+            if (rooms.IsEmpty)
+            {
+                await Wire.SendPacketAsync(stream, new Packet("system", "SERVER", "No rooms yet.", null, null));
+                return;
+            }
+
+            var roomList = string.Join(", ", rooms.Keys.OrderBy(x => x));
+            await Wire.SendPacketAsync(stream, new Packet("system", "SERVER", $"Rooms: {roomList}", null, null));
+            break;
+
+        case "where":
+            await Wire.SendPacketAsync(stream, new Packet(
+                "system", "SERVER",
+                session.Room == null ? "You are in the global lobby." : $"You are in room '{session.Room}'.",
+                null, null
+            ));
+            break;
+        
 
         default:
             await Wire.SendPacketAsync(stream, new Packet(
@@ -301,6 +426,7 @@ static class Wire
 
 class ClientSession
 {
+    public string? Room { get; set; } = null;
     public DateTime LastSeenUtc { get; set; }
     public int Id { get; }
     public TcpClient Client { get; }
